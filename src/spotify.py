@@ -69,7 +69,7 @@ class SpotifyManager:
         extracted = []
         for track in tracks:
             track = track['track'] if 'track' in track else track['data']
-            if track['name'].strip() == '': continue
+            if 'name' not in track or track['name'].strip() == '': continue
             artists = "".join([","+artist['profile']['name'] for artist in track['artists']['items']]) if 'artists' in track else ""
             extracted.append((track['name'],artists[1:]))
         return extracted
