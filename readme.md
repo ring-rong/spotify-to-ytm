@@ -1,8 +1,5 @@
-> [!NOTE]
-> This app *might* break if your Spotify account is set to any language other than English. So if you face issues, please change your Spotify account language to English and try again.
-
 > [!IMPORTANT]  
-> If you are getting an error where the chrome browser pop ups and immediately closes, please update your chrome browser version to the latest to fix this issue.
+> If you are getting an error where the chrome browser pops up and immediately closes, please update your Chrome browser to the latest version.
 
 # Spotify to YouTube Music Playlist Converter
 
@@ -14,14 +11,16 @@ Effortlessly transfer your entire Spotify music library to YouTube Music with a 
 
 ## Features
 
-- Convert Spotify playlists to YouTube Music playlists
-- Support for playlists, albums, artists, and liked songs
-- Interactive web interface for selecting and matching songs
-- Advanced fuzzy matching to find the best song equivalents
-- Refine the search results by refetching individual songs
+- **Bulk transfer** — move all your playlists and albums to YouTube Music in one click
+- **Duplicate detection** — if a playlist already exists on YTM, only missing tracks are added; fully synced playlists are skipped automatically
+- **Automatic token refresh** — if your Spotify session expires mid-transfer, the app silently re-authenticates and continues
+- Convert individual Spotify playlists, albums, artists, or Liked Songs
+- Interactive web interface for reviewing and adjusting song matches
+- Advanced fuzzy matching to find the best equivalents on YouTube Music
+- Refetch individual songs if a match is incorrect
 - Customizable playlist titles and descriptions
-- Seamless transfer without complex API configurations
-- Your music library and login data never leave your machine
+- Detailed transfer report — see exactly which songs were added, which weren't found, and which playlists were skipped
+- No API keys needed, no data leaves your machine
 
 ## Prerequisites
 
@@ -63,16 +62,23 @@ python gui.py
 4. Library Synchronization:
    - Wait 20-30 seconds for the browser to fetch your library
    - Your Spotify library will be displayed in the GUI
-   - You can close the Selenium browser window after the library is displyed
+   - You can close the Selenium browser window after the library is displayed
 
-5. Playlist Conversion:
-   - Choose any playlist, album, artist, or `Liked Songs` to convert
-   - Click `Fetch All YouTube Equivalents` to start searching for matches
+5. Transfer Options:
+
+   **Bulk transfer (recommended):**
+   - Click `⇒ Transfer All` at the top of the library page
+   - The app will process every playlist and album automatically
+   - A live progress view shows what's happening: newly created playlists, existing ones being topped up, and anything that was already complete
+   - When done, a detailed report shows how many tracks were added per playlist and which songs couldn't be matched
+
+   **Single playlist / manual mode:**
+   - Choose any playlist, album, artist, or `Liked Songs`
+   - Click `Fetch All YouTube Equivalents` to search for matches
    - Refetch individual songs if matches are incorrect
-   - Deselect any unwanted songs
-   - Click `Save Selection`
+   - Deselect any unwanted songs and click `Save Selection`
 
-6. Create YouTube Music Playlist:
+6. Create YouTube Music Playlist (manual mode only):
    - Enter a title (optional description)
    - Click Submit to create the playlist on YouTube Music
 
@@ -86,6 +92,12 @@ pip install setuptools
 ```
 
 After this, it should work as normal.
+
+#### Q: Transfer All finished, but some playlists show "couldn't fetch tracks from existing playlist"
+**A:** This means the playlist already exists on YouTube Music but the app got an empty response when trying to read its tracks — usually a temporary YouTube Music API hiccup. Re-running `Transfer All` will retry those playlists. The app never adds tracks when it can't verify what's already there, so no duplicates will be created.
+
+#### Q: Some songs show "not found on YouTube Music" in the transfer report
+**A:** The fuzzy search couldn't find a close enough match for those tracks. For important songs, use the manual single-playlist mode where you can refetch individual tracks and pick a better match yourself.
 
 #### Q: I am totally new to Python, how do I get started?
 **A:** First of all, make sure you have Python installed. If you don't, you can download the installer from [the official Python website](https://www.python.org/downloads/release/python-3127/). I would recommend watching [this 2-minute tutorial](https://www.youtube.com/watch?v=vXbEju8Fo3c) on how to properly install Python.
