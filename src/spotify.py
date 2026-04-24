@@ -16,6 +16,7 @@ class SpotifyManager:
                 self.client_token = saved_data['client_token']
                 self.persisted_queries = saved_data['persisted_queries']
                 self.library = saved_data['library']
+                self.extra_headers = saved_data.get('extra_headers', {})
                 self.session = None
 
         if not os.path.exists('spotify_auth.json'):
@@ -25,43 +26,80 @@ class SpotifyManager:
             if not self.session.has_p_keys:
                 self.session.get_persist_queries()
             self.persisted_queries = self.session.persisted_qs
+            self.extra_headers = self.session.extra_headers
             with open('spotify_auth.json', 'w') as f:
                 json.dump({
                    'client_token'       :   self.client_token,
                    'authorization'      :   self.authorization,
                    'library'            :   self.library,
                    'persisted_queries'  :   self.persisted_queries,
-                   'expires'            :   time.time() + 60*60 # looks like the tokens expire in 1 hour
+                   'extra_headers'      :   self.extra_headers,
+                   'expires'            :   time.time() + 60*60
                 },f)
         
         requests.get("http://localhost:5001/initialized")
 
-    def _get_res_from_spot(self, operation, persisted, uri=None,limit=50):
+    def _try_refresh_tokens(self):
+        """Re-extract Spotify auth tokens from the browser without rebuilding library data."""
+        try:
+            if self.session is None:
+                self.session = SetupManager()
+            # Use _get_library_auth directly — it only captures tokens, doesn't touch library lists
+            result = self.session._get_library_auth()
+            if result is None:
+                raise Exception("_get_library_auth returned None")
+            client_token, authorization, _persisted = result
+            self.client_token = client_token
+            self.authorization = authorization
+            # extra_headers are updated inside _extract_auth_from_network_logs when it finds a match
+            self.extra_headers = self.session.extra_headers
+            with open('spotify_auth.json', 'w') as f:
+                json.dump({
+                    'client_token':      self.client_token,
+                    'authorization':     self.authorization,
+                    'library':           self.library,
+                    'persisted_queries': self.persisted_queries,
+                    'extra_headers':     self.extra_headers,
+                    'expires':           time.time() + 60 * 60
+                }, f)
+            print("Spotify tokens refreshed successfully.")
+            return True
+        except Exception as e:
+            print(f"Failed to refresh Spotify tokens: {e}")
+            return False
+
+    def _get_res_from_spot(self, operation, persisted, uri=None, limit=50, _retried=False):
         variables = {
-            "uri" : uri if uri else "",
-            "locale":"",
-            "offset":0,
-            "limit":limit,
-            "enableWatchFeedEntrypoint":False if operation == "fetchPlaylist" else "",
+            "locale": "",
+            "offset": 0,
+            "limit": limit,
         }
-        if variables['uri'] == "":
-            del variables['uri']
-        endpoint = 'https://api-partner.spotify.com/pathfinder/v1/query'
-        params = {
-            'operationName': f'{operation}',
-            'variables': json.dumps(variables),
-            'extensions': persisted
+        if uri:
+            variables["uri"] = uri
+        if operation == "fetchPlaylist":
+            variables["enableWatchFeedEntrypoint"] = False
+        endpoint = 'https://api-partner.spotify.com/pathfinder/v2/query'
+        body = {
+            'operationName': operation,
+            'variables': variables,
+            'extensions': json.loads(persisted) if isinstance(persisted, str) else persisted,
         }
         headers = {
             'accept': 'application/json',
             'authorization': self.authorization,
             'client-token': self.client_token,
-            'content-type': 'application/json;charset=UTF-8'
+            'content-type': 'application/json;charset=UTF-8',
+            **self.extra_headers,
         }
-        response = requests.get(endpoint, headers=headers, params=params)
+        response = requests.post(endpoint, headers=headers, json=body)
         if response.status_code == 200:
             res_j = json.loads(response.text)
             return res_j, True
+        if response.status_code == 401 and not _retried:
+            print(f"Got 401 for {operation} — attempting token refresh...")
+            if self._try_refresh_tokens():
+                return self._get_res_from_spot(operation, persisted, uri, limit, _retried=True)
+        print(f"Error in _get_res_from_spot ({operation}): {response.status_code}")
         return response.status_code, False
     
     @staticmethod

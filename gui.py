@@ -17,6 +17,7 @@ login_statuses = {
 spot = yt = None
 loaded_library = False
 current_playlist_title = None
+batch_status = {"running": False, "done": 0, "total": 0, "current": "", "skipped": 0, "added_to": 0, "log": []}
 
 def start_sess():
     global login_statuses,spot,yt
@@ -117,9 +118,21 @@ def get():
 def get():
     global spot, loaded_library
     library = spot.library
+    n_albums = len(library.get('Albums', []))
+    n_playlists = len(library.get('Playlists', []))
+    has_liked = library.get('HasLikedSongs', False)
+    transfer_total = n_albums + n_playlists + (1 if has_liked else 0)
+
     layout = Div(
         P("Thanks for waiting! Your library is ready.") if not loaded_library else None,
-        P("Select any playlist to get started."),
+        P("Select any playlist to get started, or transfer everything at once."),
+        Button(
+            f"⇒ Transfer All ({transfer_total} items: albums + playlists)",
+            hx_get="/transfer_all",
+            hx_target=".main-view",
+            hx_swap="innerHTML",
+        ) if transfer_total > 0 else None,
+        Hr(),
         H3("Misc."),
         Ol(Li(A("Liked Songs", hx_get="/uri/liked", hx_target=".main-view"))),
         H3("Albums"),
@@ -176,6 +189,224 @@ def fetch_equivalents(uri: str):
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         results = executor.map(fetch_song, items)
         new_playlist['items'].extend(results)
+
+
+def fetch_song_safe(item):
+    song_title, artist_name = item
+    try:
+        title, artist, _, vid_id = yt.search_one(f"{song_title} ,{artist_name}")
+        return [title, artist, True, vid_id]
+    except Exception as e:
+        print(f"fetch_song_safe error: {e}")
+        return [song_title, artist_name, False, None]
+
+
+def transfer_all_bg():
+    global spot, yt, batch_status
+    library = spot.library
+    queue = []
+
+    if library.get('HasLikedSongs'):
+        queue.append(('liked', 'liked', 'Liked Songs'))
+    for al in library.get('Albums', []):
+        queue.append((al['uri'], 'album', al['name']))
+    for pl in library.get('Playlists', []):
+        queue.append((pl['uri'], 'playlist', pl['name']))
+
+    batch_status.update({"running": True, "done": 0, "total": len(queue),
+                         "current": "", "skipped": 0, "added_to": 0, "log": []})
+
+    for uri, uri_type, name in queue:
+        batch_status['current'] = name
+        entry = {"name": name}
+        try:
+            # 1. Get Spotify tracks
+            if uri_type == 'playlist':
+                tracks, ok = spot.get_playlist(uri)
+            elif uri_type == 'album':
+                tracks, ok = spot.get_albums(uri)
+            else:
+                tracks, ok = spot.get_liked()
+
+            if not ok or not isinstance(tracks, list) or not tracks:
+                entry["type"] = "error"
+                entry["reason"] = "не удалось получить треки со Spotify"
+                batch_status['log'].append(entry)
+                batch_status['done'] += 1
+                continue
+
+            # 2. Check if playlist already exists on YTM
+            try:
+                pl_id, existing_yt_tracks = yt.get_existing_playlist(name)
+            except RuntimeError as e:
+                # Playlist exists but tracks couldn't be fetched — skip to avoid duplicates
+                entry["type"] = "error"
+                entry["reason"] = str(e)
+                batch_status['log'].append(entry)
+                batch_status['done'] += 1
+                continue
+
+            if pl_id is not None:
+                missing = yt.find_missing_tracks(tracks, existing_yt_tracks)
+                if not missing:
+                    # fully complete — skip
+                    entry["type"] = "skipped"
+                    entry["total_tracks"] = len(tracks)
+                    batch_status['skipped'] += 1
+                    batch_status['log'].append(entry)
+                    batch_status['done'] += 1
+                    continue
+                # partially complete — add only missing tracks
+                tracks_to_search = missing
+                is_new = False
+            else:
+                tracks_to_search = tracks
+                is_new = True
+
+            # 3. Search YTM equivalents for needed tracks
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                results = list(executor.map(fetch_song_safe, tracks_to_search))
+
+            vid_ids = [r[-1] for r in results if r[2] and r[-1]]
+            failed_songs = [(tracks_to_search[i][0], tracks_to_search[i][1])
+                            for i, r in enumerate(results) if not r[2] or not r[-1]]
+
+            if not vid_ids:
+                entry["type"] = "error"
+                entry["reason"] = "не найдено ни одного трека на YouTube Music"
+                entry["failed_songs"] = failed_songs
+            elif is_new:
+                ok = yt.create_and_add(name, "", vid_ids)
+                if ok:
+                    entry["type"] = "created"
+                    entry["added"] = len(vid_ids)
+                    entry["failed_songs"] = failed_songs
+                else:
+                    entry["type"] = "error"
+                    entry["reason"] = "ошибка создания плейлиста"
+                    entry["failed_songs"] = failed_songs
+            else:
+                ok = yt.add_multiple_to_playlist(pl_id, vid_ids)
+                if ok:
+                    entry["type"] = "extended"
+                    entry["added"] = len(vid_ids)
+                    entry["failed_songs"] = failed_songs
+                    batch_status['added_to'] += 1
+                else:
+                    entry["type"] = "error"
+                    entry["reason"] = "ошибка добавления треков"
+                    entry["failed_songs"] = failed_songs
+
+        except Exception as e:
+            entry["type"] = "error"
+            entry["reason"] = str(e)
+
+        batch_status['log'].append(entry)
+        batch_status['done'] += 1
+
+    batch_status['running'] = False
+
+
+@app.get('/transfer_all')
+def get():
+    global batch_status, yt
+    batch_status = {"running": False, "done": 0, "total": 0, "current": "", "skipped": 0, "added_to": 0, "log": []}
+    # clear YTM playlist cache so we get fresh data
+    if hasattr(yt, '_yt_playlists_cache'):
+        del yt._yt_playlists_cache
+    threading.Thread(target=transfer_all_bg, daemon=True).start()
+    return transfer_progress_view()
+
+
+@app.get('/transfer_progress')
+def get():
+    return transfer_progress_view()
+
+
+def _entry_li(e):
+    """Render one log entry as an <li> with optional failed-songs sub-list."""
+    t = e.get("type", "error")
+    name = e.get("name", "?")
+    failed = e.get("failed_songs", [])
+
+    def failed_details():
+        if not failed:
+            return None
+        return Details(
+            Summary(f"Не найдено на YouTube Music: {len(failed)}"),
+            Ul(*[Li(f"{title} — {artist}" if artist else title)
+                 for title, artist in failed]),
+        )
+
+    if t == "skipped":
+        n = e.get("total_tracks", "?")
+        return Li(f"⏭ {name}  ({n} треков — уже полный)")
+
+    if t == "created":
+        added = e.get("added", 0)
+        total_src = added + len(failed)
+        return Li(
+            f"🆕 {name}  — добавлено {added}/{total_src} треков",
+            failed_details(),
+        )
+
+    if t == "extended":
+        added = e.get("added", 0)
+        total_src = added + len(failed)
+        return Li(
+            f"➕ {name}  — дополнен, добавлено {added}/{total_src} треков",
+            failed_details(),
+        )
+
+    # error
+    reason = e.get("reason", "неизвестная ошибка")
+    return Li(
+        f"⚠ {name}  — {reason}",
+        failed_details(),
+    )
+
+
+def transfer_progress_view():
+    global batch_status
+    s = batch_status
+    log = s.get('log', [])
+
+    if s['running']:
+        recent = log[-8:]  # last 8 completed items shown live
+        return Div(
+            H3(f"Перенос... {s['done']}/{s['total']}"),
+            Progress(value=str(s['done']), max=str(s['total'])),
+            P(f"⏳ Сейчас: {s['current']}"),
+            (Ul(*[_entry_li(e) for e in reversed(recent)]) if recent else None),
+            hx_get="/transfer_progress",
+            hx_trigger="every 2s",
+            hx_swap="outerHTML",
+        )
+
+    elif s['total'] > 0:
+        created  = [e for e in log if e.get('type') == 'created']
+        extended = [e for e in log if e.get('type') == 'extended']
+        skipped  = [e for e in log if e.get('type') == 'skipped']
+        errors   = [e for e in log if e.get('type') == 'error']
+        return Div(
+            H3("✓ Перенос завершён!"),
+            Ul(
+                Li(f"🆕 Создано новых: {len(created)}"),
+                Li(f"➕ Дополнено существующих: {len(extended)}"),
+                Li(f"⏭ Пропущено (уже полные): {len(skipped)}"),
+                Li(f"⚠ Ошибок: {len(errors)}") if errors else None,
+            ),
+            *([Details(Summary(f"🆕 Созданные плейлисты ({len(created)})"),
+               Ul(*[_entry_li(e) for e in created]))] if created else []),
+            *([Details(Summary(f"➕ Дополненные плейлисты ({len(extended)})"),
+               Ul(*[_entry_li(e) for e in extended]))] if extended else []),
+            *([Details(Summary(f"⚠ Ошибки ({len(errors)})"),
+               Ul(*[_entry_li(e) for e in errors]))] if errors else []),
+            A("Вернуться в библиотеку", hx_get="/library", hx_target=".main-view",
+              cls="button"),
+        )
+
+    return P("Перенос не запущен")
 
 
 @dataclass

@@ -8,7 +8,6 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
 
 class SetupManager:
 
@@ -22,12 +21,21 @@ class SetupManager:
     
     def __init__(self):
         if not self._webdriver_running:
-            d = DesiredCapabilities.CHROME
-            d['goog:loggingPrefs'] = { 'performance':'ALL' } # this took way too long
             pwd = path.dirname(__file__)
-            self.driver = uc.Chrome(user_data_dir= f"{pwd}{path.sep}webdriver_profile2",desired_capabilities=d)
+            options = uc.ChromeOptions()
+            options.add_argument('--lang=en-US')
+            options.add_experimental_option('prefs', {'intl.accept_languages': 'en,en-US'})
+            options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+            self.driver = uc.Chrome(user_data_dir= f"{pwd}{path.sep}webdriver_profile2", options=options, version_main=147)
             self._webdriver_running = True
 
+            self.extra_headers = {
+                'app-platform': 'WebPlayer',
+                'spotify-app-version': '1.2.89.282.g2b043556',
+                'origin': 'https://open.spotify.com',
+                'referer': 'https://open.spotify.com/',
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
+            }
             self._login_spotify()
             self.library = {
                 'Albums' : [],
@@ -96,9 +104,17 @@ class SetupManager:
             return None, None, json.dumps(url_j['extensions'])
 
     @staticmethod
-    def _extract_auth_from_body(body, headers):
+    def _extract_auth_from_body(body, headers, operation_name=None):
         try:
             body_json = json.loads(body)
+            # handle GraphQL batch requests (array of operations)
+            if isinstance(body_json, list):
+                if operation_name:
+                    body_json = next((op for op in body_json if op.get('operationName') == operation_name), None)
+                else:
+                    body_json = body_json[0]
+                if body_json is None:
+                    raise KeyError(f"Operation '{operation_name}' not found in batch request")
             auth = headers['authorization']
             c_token = headers['client-token']
             persisted_query = json.dumps(body_json['extensions'])
@@ -122,8 +138,16 @@ class SetupManager:
                         return client_token, authorization, persisted_query
                 if f'"operationName":"{operation_name}"' in body:
                     headers = request["headers"]
-                    client_token, authorization, persisted_query = self._extract_auth_from_body(body, headers)
+                    client_token, authorization, persisted_query = self._extract_auth_from_body(body, headers, operation_name)
                     if client_token and authorization and persisted_query:
+                        # capture extra headers Spotify requires
+                        self.extra_headers = {
+                            'app-platform': headers.get('app-platform', 'WebPlayer'),
+                            'spotify-app-version': headers.get('spotify-app-version', ''),
+                            'origin': 'https://open.spotify.com',
+                            'referer': 'https://open.spotify.com/',
+                            'user-agent': headers.get('user-agent', ''),
+                        }
                         return client_token, authorization, persisted_query
         print(f"Could not find the {operation_name} request in the network logs.")
         if operation_name == "libraryV3":
@@ -137,62 +161,58 @@ class SetupManager:
     def _get_library_auth(self):
         # turning on network logs
         self.driver.execute_cdp_cmd("Network.enable", {})
-        # we go back to homepage
-        self.driver.get('https://open.spotify.com')
-        
-        # trigger the library request
+        # navigate to collection page — triggers libraryV3 request
+        self.driver.get('https://open.spotify.com/collection/playlists')
         try:
-            WebDriverWait(self.driver, 5).until(
+            # wait for the library button to confirm page loaded
+            WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, '[aria-label="Open Your Library"]'))
             )
-            library_button = self.driver.find_element(By.CSS_SELECTOR,'[aria-label="Open Your Library"]')
+            # click it to expand the library panel and trigger libraryV3
+            library_button = self.driver.find_element(By.CSS_SELECTOR, '[aria-label="Open Your Library"]')
             library_button.click()
-        except TimeoutException or NoSuchElementException:
-            try:
-                collapse_button = self.driver.find_element(By.CSS_SELECTOR, '[aria-label="Collapse Your Library"]')
-                collapse_button.click()
-                library_button = self.driver.find_element(By.CSS_SELECTOR,'[aria-label="Open Your Library"]')
-                library_button.click()
-            except NoSuchElementException:
-                print("Could not find the library button. Possible reasons:\n" \
-                      "1. You are not logged in to Spotify.\n" \
-                      "2. Your spotify is using a language other than English.")
-                print("Trying to extract the library data from network logs "\
-                      "without clicking the library button...")
+            time.sleep(3)
+        except (TimeoutException, NoSuchElementException):
+            print("Library button not found, trying to extract auth from navigation request...")
         return self._extract_auth_from_network_logs('libraryV3')
 
 
     def get_library(self):
         client_token, authorization, persisted_query = self._get_library_auth()
 
-        url = 'https://api-partner.spotify.com/pathfinder/v1/query'
+        url = 'https://api-partner.spotify.com/pathfinder/v2/query'
         limit = 50
-        params = {
-            'operationName': 'libraryV3',
-            'variables': f'{{"filters":[],"order":null,"textFilter":"","features":["LIKED_SONGS","YOUR_EPISODES"],"limit":{limit},"offset":0,"flatten":false,"expandedFolders":[],"folderUri":null,"includeFoldersWhenFlattening":true}}',
-            'extensions': persisted_query
-        }
 
         headers = {
             'accept': 'application/json',
             'authorization': authorization,
             'client-token': client_token,
-            'content-type': 'application/json;charset=UTF-8'
+            'content-type': 'application/json;charset=UTF-8',
+            **self.extra_headers,
         }
 
-        response = requests.get(url, headers=headers, params=params)
-        print('' if response.status_code == 200 else f"Error! Code: {response.status_code}")
-        
+        def make_body(limit):
+            return {
+                'operationName': 'libraryV3',
+                'variables': {
+                    'filters': [], 'order': None, 'textFilter': '',
+                    'features': ['LIKED_SONGS', 'YOUR_EPISODES'],
+                    'limit': limit, 'offset': 0, 'flatten': False,
+                    'expandedFolders': [], 'folderUri': None,
+                    'includeFoldersWhenFlattening': True
+                },
+                'extensions': json.loads(persisted_query)
+            }
+
+        response = requests.post(url, headers=headers, json=make_body(limit))
+        if response.status_code != 200:
+            print(f"Error! Code: {response.status_code}, Body: {response.text[:300]}")
+
         if response.status_code == 200:
             res_j = json.loads(response.text)
             total_count = res_j['data']['me']['libraryV3']['totalCount']
             if total_count > limit:
-                params = {
-                    'operationName': 'libraryV3',
-                    'variables': f'{{"filters":[],"order":null,"textFilter":"","features":["LIKED_SONGS","YOUR_EPISODES"],"limit":{(2 + total_count//25)*25},"offset":0,"flatten":false,"expandedFolders":[],"folderUri":null,"includeFoldersWhenFlattening":true}}',
-                    'extensions': persisted_query
-                }
-                response = requests.get(url, headers=headers, params=params)
+                response = requests.post(url, headers=headers, json=make_body((2 + total_count//25)*25))
                 res_j = json.loads(response.text)
             
             for cnt, item in enumerate(res_j['data']['me']['libraryV3']['items']):
@@ -339,19 +359,22 @@ class SetupManager:
 
     def _login_ytm(self):
         self.driver.get("https://music.youtube.com/")
-         
-        # check if already logged in:
+
+        # check if already logged in via avatar button
         logged_in = False
         try:
-            WebDriverWait(self.driver,5).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, '.settings-button'))
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, '#avatar-btn, ytmusic-settings-button'))
             )
             logged_in = True
         except TimeoutException:
+            # not logged in — check that the page loaded at all
             try:
-                self.driver.find_element(By.CSS_SELECTOR, '.sign-in-link')
-            except:
-                raise "Network Error"
+                WebDriverWait(self.driver, 5).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, 'ytmusic-app, #header'))
+                )
+            except TimeoutException:
+                raise Exception("Network Error: YouTube Music failed to load")
         if not logged_in:
             user_confirm = False
             requests.get("http://localhost:5001/update_login?status=false&type=ytm")
@@ -372,8 +395,8 @@ class SetupManager:
         # the driver might be already on the home page but going back to ytm just in case
         self.driver.get('https://music.youtube.com/')
 
-        WebDriverWait(self.driver,5).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, '.settings-button'))
+        WebDriverWait(self.driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, '#avatar-btn, ytmusic-settings-button'))
         )
 
         last_height = self.driver.execute_script("return document.body.scrollHeight")
